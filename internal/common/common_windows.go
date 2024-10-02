@@ -61,6 +61,7 @@ const (
 	ProcessWow64Information = 26
 	ProcessQueryInformation = windows.PROCESS_DUP_HANDLE | windows.PROCESS_QUERY_INFORMATION
 
+	SystemProcessInformationClass        = 5
 	SystemExtendedHandleInformationClass = 64
 )
 

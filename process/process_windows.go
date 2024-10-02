@@ -50,14 +50,6 @@ var (
 
 const processQueryInformation = windows.PROCESS_QUERY_LIMITED_INFORMATION
 
-type systemProcessorInformation struct {
-	ProcessorArchitecture uint16
-	ProcessorLevel        uint16
-	ProcessorRevision     uint16
-	Reserved              uint16
-	ProcessorFeatureBits  uint16
-}
-
 type systemInfo struct {
 	wProcessorArchitecture      uint16
 	wReserved                   uint16
@@ -199,6 +191,128 @@ type winTokenPrivileges struct {
 type (
 	winLong  int32
 	winDWord uint32
+)
+
+type systemProcessorInformation struct {
+	NextEntryOffset              uint32
+	NumberOfThreads              uint32
+	SpareLi1                     int64
+	SpareLi2                     int64
+	SpareLi3                     int64
+	CreateTime                   int64
+	UserTime                     int64
+	KernelTime                   int64
+	ImageName                    unicodeString
+	BasePriority                 int32
+	UniqueProcessId              uintptr
+	InheritedFromUniqueProcessId uintptr
+	HandleCount                  uint32
+	SessionId                    uint32
+	PageDirectoryBase            uintptr
+	PeakVirtualSize              uintptr
+	VirtualSize                  uintptr
+	PageFaultCount               uint32
+	PeakWorkingSetSize           uintptr
+	WorkingSetSize               uintptr
+	QuotaPeakPagedPoolUsage      uintptr
+	QuotaPagedPoolUsage          uintptr
+	QuotaPeakNonPagedPoolUsage   uintptr
+	QuotaNonPagedPoolUsage       uintptr
+	PagefileUsage                uintptr
+	PeakPagefileUsage            uintptr
+	PrivatePageCount             uintptr
+	ReadOperationCount           int64
+	WriteOperationCount          int64
+	OtherOperationCount          int64
+	ReadTransferCount            int64
+	WriteTransferCount           int64
+	OtherTransferCount           int64
+	Threads                      []systemThreadInformation
+}
+
+type unicodeString struct {
+	Length        uint16
+	MaximumLength uint16
+	Buffer        *uint16
+}
+
+type systemThreadInformation struct {
+	KernelTime      int64
+	UserTime        int64
+	CreateTime      int64
+	WaitTime        int32
+	StartAddress    uintptr
+	ClientID        clientId
+	Priority        int32
+	BasePriority    int32
+	ContextSwitches uint32
+	ThreadState     windowsThreadState
+	WaitReason      windowsThreadWaitReason
+}
+
+type clientId struct {
+	UniqueProcess uintptr
+	UniqueThread  uintptr
+}
+
+type windowsThreadState uint32
+
+const (
+	ThreadStateInitialized windowsThreadState = iota
+	ThreadStateReady
+	ThreadStateRunning
+	ThreadStateStandby
+	ThreadStateTerminated
+	ThreadStateWaiting
+	ThreadStateTransition
+	ThreadStateDeferredReady
+	ThreadStateGateWait
+	ThreadStateMaximumThreadState
+)
+
+type windowsThreadWaitReason uint32
+
+const (
+	WaitReasonExecutive windowsThreadWaitReason = iota
+	WaitReasonFreePage
+	WaitReasonPageIn
+	WaitReasonPoolAllocation
+	WaitReasonDelayExecution
+	WaitReasonSuspended
+	WaitReasonUserRequest
+	WaitReasonWrExecutive
+	WaitReasonWrFreePage
+	WaitReasonWrPageIn
+	WaitReasonWrPoolAllocation
+	WaitReasonWrDelayExecution
+	WaitReasonWrSuspended
+	WaitReasonWrUserRequest
+	WaitReasonWrEventPair
+	WaitReasonWrQueue
+	WaitReasonWrLpcReceive
+	WaitReasonWrLpcReply
+	WaitReasonWrVirtualMemory
+	WaitReasonWrPageOut
+	WaitReasonWrRendezvous
+	WaitReasonWrKeyedEvent
+	WaitReasonWrTerminated
+	WaitReasonWrProcessInSwap
+	WaitReasonWrCpuRateControl
+	WaitReasonWrCalloutStack
+	WaitReasonWrKernel
+	WaitReasonWrResource
+	WaitReasonWrPushLock
+	WaitReasonWrMutex
+	WaitReasonWrQuantumEnd
+	WaitReasonWrDispatchInt
+	WaitReasonWrPreempted
+	WaitReasonWrYieldExecution
+	WaitReasonWrFastMutex
+	WaitReasonWrGuardedMutex
+	WaitReasonWrRundown
+	WaitReasonWrAlertByThreadId
+	WaitReasonWrDeferredPreempt
+	WaitReasonMaximumWaitReason
 )
 
 func init() {
@@ -437,7 +551,18 @@ func (p *Process) CwdWithContext(_ context.Context) (string, error) {
 }
 
 func (p *Process) StatusWithContext(ctx context.Context) ([]string, error) {
-	return []string{""}, common.ErrNotImplementedError
+	suspended, err := psutilProcIsSuspended(p.Pid)
+	if err != nil {
+		return []string{""}, err
+	}
+
+	if suspended {
+		p.status = string([]byte(Stop))
+	} else {
+		p.status = string([]byte(Running))
+	}
+
+	return []string{p.status}, nil
 }
 
 func (p *Process) ForegroundWithContext(ctx context.Context) (bool, error) {
@@ -1176,4 +1301,65 @@ func convertUTF16ToString(src []byte) string {
 		srcIdx += 2
 	}
 	return syscall.UTF16ToString(codePoints)
+}
+
+func psutilGetProcInfo(pid int32) (*systemProcessorInformation, error) {
+	buffer := make([]byte, 1024)
+	var size uint32
+
+	st := common.CallWithExpandingBuffer(
+		func() common.NtStatus {
+			return common.NtQuerySystemInformation(
+				common.SystemProcessInformationClass,
+				&buffer[0],
+				uint32(len(buffer)),
+				&size,
+			)
+		},
+		&buffer,
+		&size,
+	)
+	if st.IsError() {
+		return nil, st.Error()
+	}
+
+	process := (*systemProcessorInformation)(unsafe.Pointer(&buffer[0]))
+	for {
+		if uintptr(process.UniqueProcessId) == uintptr(pid) {
+			threads := make([]systemThreadInformation, process.NumberOfThreads)
+			threadPtr := uintptr(unsafe.Pointer(process)) + unsafe.Offsetof(process.Threads)
+			for i := uint32(0); i < process.NumberOfThreads; i++ {
+				thread := (*systemThreadInformation)(unsafe.Pointer(threadPtr))
+				if thread == nil {
+					return nil, fmt.Errorf("invalid thread pointer")
+				}
+				threads[i] = *thread
+				threadPtr += unsafe.Sizeof(systemThreadInformation{})
+			}
+
+			process.Threads = threads
+
+			return process, nil
+		}
+		if process.NextEntryOffset == 0 {
+			break
+		}
+		process = (*systemProcessorInformation)(unsafe.Pointer(uintptr(unsafe.Pointer(process)) + uintptr(process.NextEntryOffset)))
+	}
+
+	return nil, syscall.ERROR_NOT_FOUND
+}
+
+func psutilProcIsSuspended(pid int32) (bool, error) {
+	process, err := psutilGetProcInfo(pid)
+	if err != nil {
+		return false, err
+	}
+
+	for i := uint32(0); i < process.NumberOfThreads; i++ {
+		if process.Threads[i].ThreadState != ThreadStateWaiting || process.Threads[i].WaitReason != WaitReasonSuspended {
+			return false, nil
+		}
+	}
+	return true, nil
 }
